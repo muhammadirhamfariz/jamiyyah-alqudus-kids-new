@@ -5,31 +5,126 @@ import {
   Menu, X as CloseIcon, UserCircle, Clock
 } from 'lucide-react';
 
-// --- INISIALISASI FIREBASE ---
-import { initializeApp } from 'firebase/app';
-import { getAuth, signInAnonymously, signInWithCustomToken, onAuthStateChanged } from 'firebase/auth';
-import { 
-  getFirestore, collection, doc, setDoc, getDoc, getDocs, 
-  onSnapshot, deleteDoc, updateDoc, addDoc 
-} from 'firebase/firestore';
+// IMPORTANT: To use this in your local Vite project, uncomment the following line
+// and install the package: npm install @supabase/supabase-js
+// import { createClient } from '@supabase/supabase-js';
 
-const firebaseConfig = {
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN,
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID,
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET,
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID,
-  appId: import.meta.env.VITE_FIREBASE_APP_ID,
+// --- INISIALISASI SUPABASE ---
+// Mendapatkan env secara aman untuk menghindari error pada environment tertentu
+const getEnv = (key) => {
+  try { return typeof import.meta !== 'undefined' && import.meta.env ? import.meta.env[key] : ''; } catch (e) { return ''; }
 };
+const supabaseUrl = getEnv('VITE_SUPABASE_URL');
+const supabaseKey = getEnv('VITE_SUPABASE_PUBLISHABLE_KEY');
 
-const app = initializeApp(firebaseConfig);
-const auth = getAuth(app);
-const db = getFirestore(app);
-const appId = import.meta.env.VITE_FIREBASE_APP_ID || 'jamiyyah-al-qudus-kids';
+// --- MOCK SUPABASE CLIENT UNTUK PREVIEW ---
+// Menggunakan LocalStorage agar sistem tetap berfungsi penuh di dalam browser preview ini.
+// Ganti `createMockSupabaseClient()` dengan `createClient(supabaseUrl, supabaseKey)` saat dipasang di project lokal Anda.
+function createMockSupabaseClient() {
+  const getStorage = (table) => JSON.parse(localStorage.getItem(`mock_supa_${table}`) || '[]');
+  const setStorage = (table, data) => localStorage.setItem(`mock_supa_${table}`, JSON.stringify(data));
+  const genId = () => Math.random().toString(36).substr(2, 9);
+  const listeners = {};
+  const notify = (table) => { if(listeners[table]) listeners[table].forEach(cb => cb()); };
 
-// --- PATH DATABASE ---
-const getCollectionPath = (colName) => `artifacts/${appId}/public/data/${colName}`;
-const getDocPath = (colName, docId) => `artifacts/${appId}/public/data/${colName}/${docId}`;
+  return {
+    from: (table) => ({
+      select: (cols) => {
+        let result = getStorage(table);
+        const chain = {
+          eq: (field, value) => { result = result.filter(item => item[field] === value); return chain; },
+          single: () => ({ then: (res, rej) => Promise.resolve({ data: result[0] || null, error: null }).then(res).catch(rej) }),
+          then: (res, rej) => Promise.resolve({ data: result, error: null }).then(res).catch(rej)
+        };
+        return chain;
+      },
+      insert: (payload) => {
+        const data = getStorage(table);
+        const newItems = Array.isArray(payload) ? payload.map(p => ({id: genId(), ...p})) : [{id: genId(), ...payload}];
+        setStorage(table, [...data, ...newItems]);
+        notify(table);
+        const res = { data: newItems, error: null };
+        return { select: () => ({ then: (cb) => Promise.resolve(res).then(cb) }), then: (cb) => Promise.resolve(res).then(cb) };
+      },
+      update: (payload) => ({
+        eq: async (field, value) => {
+            let data = getStorage(table);
+            data = data.map(item => item[field] === value ? { ...item, ...payload } : item);
+            setStorage(table, data);
+            notify(table);
+            return { data: [], error: null };
+        }
+      }),
+      delete: () => ({
+        eq: async (field, value) => {
+            let data = getStorage(table);
+            data = data.filter(item => item[field] !== value);
+            setStorage(table, data);
+            notify(table);
+            return { data: [], error: null };
+        }
+      }),
+      upsert: async (payload) => {
+        let data = getStorage(table);
+        const itemIdx = data.findIndex(i => i.id === payload.id);
+        if (itemIdx >= 0) { data[itemIdx] = { ...data[itemIdx], ...payload }; } 
+        else { data.push({ id: payload.id || genId(), ...payload }); }
+        setStorage(table, data);
+        notify(table);
+        return { data: [], error: null };
+      }
+    }),
+    channel: (name) => {
+        const table = name.split(':')[1];
+        let cb;
+        const chain = {
+            on: (type, filter, callback) => { cb = callback; return chain; },
+            subscribe: () => {
+                if(!listeners[table]) listeners[table] = [];
+                if (cb) listeners[table].push(cb);
+                return { topic: name };
+            }
+        };
+        return chain;
+    },
+    removeChannel: () => {}
+  }
+}
+
+const supabase = createMockSupabaseClient();
+
+// --- HOOK REALTIME SUPABASE ---
+// Pengganti onSnapshot Firebase untuk auto-sync data dari tabel
+function useSupabaseData(tableName) {
+  const [data, setData] = useState([]);
+  
+  useEffect(() => {
+    let isMounted = true;
+    const fetchData = async () => {
+      const { data: res, error } = await supabase.from(tableName).select('*');
+      if (error) {
+         console.error(`Error fetching ${tableName}:`, error);
+         return;
+      }
+      if (isMounted) setData(res || []);
+    };
+    
+    fetchData();
+    
+    const channel = supabase.channel(`public:${tableName}`)
+      .on('postgres_changes', { event: '*', schema: 'public', table: tableName }, () => {
+        fetchData();
+      })
+      .subscribe();
+      
+    return () => {
+      isMounted = false;
+      supabase.removeChannel(channel);
+    };
+  }, [tableName]);
+  
+  return data;
+}
 
 // --- DAFTAR AKUN ADMIN ---
 const ADMIN_LIST = [
@@ -97,11 +192,20 @@ const Card = ({ title, value, icon: Icon, colorClass }) => (
   </div>
 );
 
+const NavButton = ({ icon: Icon, label, active, onClick }) => (
+  <button
+    onClick={onClick}
+    className={`flex items-center w-full px-4 py-3 rounded-lg font-medium transition-colors ${
+      active ? 'bg-emerald-800 text-white' : 'text-emerald-100 hover:bg-emerald-800 hover:text-white'
+    }`}
+  >
+    <Icon className="w-5 h-5 mr-3" />
+    {label}
+  </button>
+);
+
 // --- KOMPONEN UTAMA ---
 export default function App() {
-  const [authUser, setAuthUser] = useState(null);
-  const [isAuthLoading, setIsAuthLoading] = useState(true);
-  
   const [view, setView] = useState('landing'); 
   const [adminNav, setAdminNav] = useState('dashboard');
   const [parentData, setParentData] = useState(null); 
@@ -110,31 +214,7 @@ export default function App() {
 
   const showToast = (message, type = 'success') => setToast({ message, type });
 
-  useEffect(() => {
-    const initAuth = async () => {
-      try {
-        await signInAnonymously(auth);
-      } catch (error) {
-        console.error("Auth error:", error);
-      }
-    };
-    initAuth();
-
-    const unsubscribe = onAuthStateChanged(auth, (user) => {
-      setAuthUser(user);
-      setIsAuthLoading(false);
-    });
-    return () => unsubscribe();
-  }, []);
-
-  if (isAuthLoading) {
-    return <div className="min-h-screen flex items-center justify-center bg-emerald-50"><div className="animate-spin rounded-full h-12 w-12 border-t-2 border-b-2 border-emerald-600"></div></div>;
-  }
-
-  if (!authUser) {
-    return <div className="min-h-screen flex items-center justify-center bg-emerald-50 text-red-600 font-bold">Gagal menghubungkan ke database sistem. Muat ulang halaman.</div>;
-  }
-
+  // Pengecekan Firebase Auth telah dihapus, langsung merender Main App Shell
   return (
     <div className="min-h-screen bg-gray-50 font-sans text-gray-800">
       {toast && <Toast message={toast.message} type={toast.type} onClose={() => setToast(null)} />}
@@ -144,8 +224,6 @@ export default function App() {
           onAdminLogin={() => setView('admin')} 
           onParentLogin={(data) => { setParentData(data); setView('parent'); }}
           showToast={showToast}
-          db={db}
-          authUser={authUser}
         />
       )}
 
@@ -196,12 +274,12 @@ export default function App() {
 
           <main className="flex-1 flex flex-col h-screen overflow-hidden pt-16 md:pt-0 bg-gray-50">
             <div className="flex-1 overflow-y-auto p-4 md:p-8">
-              {adminNav === 'dashboard' && <AdminDashboard db={db} authUser={authUser} setAdminNav={setAdminNav} showToast={showToast} />}
-              {adminNav === 'peserta' && <AdminPeserta db={db} authUser={authUser} showToast={showToast} />}
-              {adminNav === 'kehadiran' && <AdminKehadiran db={db} authUser={authUser} showToast={showToast} />}
-              {adminNav === 'kas' && <AdminKas db={db} authUser={authUser} showToast={showToast} />}
-              {adminNav === 'iuran' && <AdminIuran db={db} authUser={authUser} showToast={showToast} />}
-              {adminNav === 'jadwal' && <AdminJadwal db={db} authUser={authUser} showToast={showToast} />}
+              {adminNav === 'dashboard' && <AdminDashboard setAdminNav={setAdminNav} showToast={showToast} />}
+              {adminNav === 'peserta' && <AdminPeserta showToast={showToast} />}
+              {adminNav === 'kehadiran' && <AdminKehadiran showToast={showToast} />}
+              {adminNav === 'kas' && <AdminKas showToast={showToast} />}
+              {adminNav === 'iuran' && <AdminIuran showToast={showToast} />}
+              {adminNav === 'jadwal' && <AdminJadwal showToast={showToast} />}
             </div>
           </main>
         </div>
@@ -211,27 +289,13 @@ export default function App() {
         <ParentDashboard 
           participant={parentData} 
           onBack={() => { setView('landing'); setParentData(null); }} 
-          db={db}
-          authUser={authUser}
         />
       )}
     </div>
   );
 }
 
-const NavButton = ({ icon: Icon, label, active, onClick }) => (
-  <button
-    onClick={onClick}
-    className={`flex items-center w-full px-4 py-3 rounded-lg font-medium transition-colors ${
-      active ? 'bg-emerald-800 text-white' : 'text-emerald-100 hover:bg-emerald-800 hover:text-white'
-    }`}
-  >
-    <Icon className="w-5 h-5 mr-3" />
-    {label}
-  </button>
-);
-
-function LandingView({ onAdminLogin, onParentLogin, showToast, db, authUser }) {
+function LandingView({ onAdminLogin, onParentLogin, showToast }) {
   const [isAdminMode, setIsAdminMode] = useState(false);
   const [username, setUsername] = useState('');
   const [password, setPassword] = useState('');
@@ -252,15 +316,17 @@ function LandingView({ onAdminLogin, onParentLogin, showToast, db, authUser }) {
 
   const handleParentLogin = async (e) => {
     e.preventDefault();
-    if (!searchUsername.trim() || !authUser) return;
+    if (!searchUsername.trim()) return;
     setLoading(true);
     try {
-      const colRef = collection(db, getCollectionPath('participants'));
-      const querySnapshot = await getDocs(colRef);
+      // Menggunakan Supabase API untuk mencari data pada tabel peserta
+      const { data, error } = await supabase.from('peserta').select('*');
+      if (error) throw error;
+      
       let found = null;
-      querySnapshot.forEach((doc) => {
-        if (doc.data().username.toLowerCase() === searchUsername.toLowerCase().trim()) {
-          found = { id: doc.id, ...doc.data() };
+      data.forEach((doc) => {
+        if (doc.username.toLowerCase() === searchUsername.toLowerCase().trim()) {
+          found = doc;
         }
       });
 
@@ -363,52 +429,50 @@ function LandingView({ onAdminLogin, onParentLogin, showToast, db, authUser }) {
   );
 }
 
-function AdminDashboard({ db, authUser, setAdminNav, showToast }) {
+function AdminDashboard({ setAdminNav, showToast }) {
   const [stats, setStats] = useState({ totalPeserta: 0, hadir: 0, sakit: 0, izin: 0, tk: 0, kasLunas: 0, totalIuran: 0, jadwalTerdekat: null });
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
-    if (!authUser) return;
     const fetchStatsAndSeed = async () => {
       try {
-        const pRef = collection(db, getCollectionPath('participants'));
-        const pSnap = await getDocs(pRef);
-        let totalP = pSnap.size;
+        const { data: pData } = await supabase.from('peserta').select('*');
+        let totalP = pData?.length || 0;
         
+        // Auto-seed data jika kosong
         if (totalP === 0) {
           showToast('Menginisialisasi 60 data peserta...', 'success');
-          for (const p of INITIAL_PARTICIPANTS) {
-            await addDoc(pRef, { nama: p.nama, username: p.username, createdAt: new Date().toISOString() });
-          }
+          const seedData = INITIAL_PARTICIPANTS.map(p => ({ nama: p.nama, username: p.username, createdAt: new Date().toISOString() }));
+          await supabase.from('peserta').insert(seedData);
           totalP = INITIAL_PARTICIPANTS.length;
         }
 
-        const aSnap = await getDocs(collection(db, getCollectionPath('attendances')));
+        const { data: aData } = await supabase.from('attendances').select('status');
         let h = 0, s = 0, i = 0, tk = 0;
-        aSnap.forEach(doc => {
-          const stat = doc.data().status;
+        (aData || []).forEach(doc => {
+          const stat = doc.status;
           if(stat === 'hadir') h++;
           if(stat === 'sakit') s++;
           if(stat === 'izin') i++;
           if(stat === 'tanpa_keterangan') tk++;
         });
 
-        const kSnap = await getDocs(collection(db, getCollectionPath('kas')));
+        const { data: kData } = await supabase.from('kas').select('status');
         let kl = 0;
-        kSnap.forEach(doc => { if(doc.data().status === 'sudah_bayar') kl++; });
+        (kData || []).forEach(doc => { if(doc.status === 'sudah_bayar') kl++; });
 
-        const iSnap = await getDocs(collection(db, getCollectionPath('iurans')));
-        const jSnap = await getDocs(collection(db, getCollectionPath('schedules')));
-        let schedules = [];
-        jSnap.forEach(doc => schedules.push({ id: doc.id, ...doc.data() }));
+        const { data: iSnap } = await supabase.from('iurans').select('id');
+        const { data: jSnap } = await supabase.from('activities').select('*'); // Supabase activities
+        
+        let schedules = jSnap || [];
         schedules.sort((a, b) => new Date(a.tanggal).getTime() - new Date(b.tanggal).getTime());
         const upcoming = schedules.find(sched => new Date(sched.tanggal) >= new Date()) || schedules[0] || null;
 
-        setStats({ totalPeserta: totalP, hadir: h, sakit: s, izin: i, tk, kasLunas: kl, totalIuran: iSnap.size, jadwalTerdekat: upcoming });
+        setStats({ totalPeserta: totalP, hadir: h, sakit: s, izin: i, tk, kasLunas: kl, totalIuran: iSnap?.length || 0, jadwalTerdekat: upcoming });
       } catch (err) { console.error(err); } finally { setLoading(false); }
     };
     fetchStatsAndSeed();
-  }, [db, authUser, showToast]);
+  }, [showToast]);
 
   if (loading) return <div className="text-center py-10 text-emerald-700">Memuat dashboard...</div>;
 
@@ -446,22 +510,14 @@ function AdminDashboard({ db, authUser, setAdminNav, showToast }) {
   );
 }
 
-function AdminPeserta({ db, authUser, showToast }) {
-  const [participants, setParticipants] = useState([]);
+function AdminPeserta({ showToast }) {
+  const participantsData = useSupabaseData('peserta');
+  const participants = [...participantsData].sort((a, b) => a.nama.localeCompare(b.nama));
+  
   const [search, setSearch] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [formData, setFormData] = useState({ id: null, nama: '', username: '' });
   const [deleteId, setDeleteId] = useState(null);
-
-  useEffect(() => {
-    if (!authUser) return;
-    const unsub = onSnapshot(collection(db, getCollectionPath('participants')), (snapshot) => {
-      const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
-      data.sort((a, b) => a.nama.localeCompare(b.nama));
-      setParticipants(data);
-    });
-    return () => unsub();
-  }, [db, authUser]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -472,10 +528,10 @@ function AdminPeserta({ db, authUser, showToast }) {
     }
     try {
       if (formData.id) {
-        await updateDoc(doc(db, getDocPath('participants', formData.id)), { nama: formData.nama, username: formData.username });
+        await supabase.from('peserta').update({ nama: formData.nama, username: formData.username }).eq('id', formData.id);
         showToast('Data berhasil diperbarui.');
       } else {
-        await addDoc(collection(db, getCollectionPath('participants')), { nama: formData.nama, username: formData.username, createdAt: new Date().toISOString() });
+        await supabase.from('peserta').insert({ nama: formData.nama, username: formData.username, createdAt: new Date().toISOString() });
         showToast('Peserta berhasil ditambahkan.');
       }
       setIsModalOpen(false);
@@ -486,7 +542,7 @@ function AdminPeserta({ db, authUser, showToast }) {
   const handleDelete = async () => {
     if (!deleteId) return;
     try {
-      await deleteDoc(doc(db, getDocPath('participants', deleteId)));
+      await supabase.from('peserta').delete().eq('id', deleteId);
       showToast('Data berhasil dihapus.');
       setDeleteId(null);
     } catch (err) { showToast('Gagal menghapus.', 'error'); }
@@ -547,50 +603,38 @@ function AdminPeserta({ db, authUser, showToast }) {
   );
 }
 
-function AdminKehadiran({ db, authUser, showToast }) {
-  const [meetings, setMeetings] = useState([]);
-  const [participants, setParticipants] = useState([]);
+function AdminKehadiran({ showToast }) {
+  const meetingsData = useSupabaseData('meetings');
+  const meetings = [...meetingsData].sort((a,b) => new Date(b.tanggal).getTime() - new Date(a.tanggal).getTime());
+
+  const participantsData = useSupabaseData('peserta');
+  const participants = [...participantsData].sort((a, b) => a.nama.localeCompare(b.nama));
+  
   const [selectedMeetingId, setSelectedMeetingId] = useState(null);
   const [attendances, setAttendances] = useState({});
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [newDate, setNewDate] = useState('');
   const [deleteId, setDeleteId] = useState(null);
 
-  useEffect(() => {
-    if (!authUser) return;
-    const unsubM = onSnapshot(collection(db, getCollectionPath('meetings')), (snap) => {
-      const ms = snap.docs.map(d => ({id: d.id, ...d.data()}));
-      ms.sort((a,b) => new Date(b.tanggal).getTime() - new Date(a.tanggal).getTime());
-      setMeetings(ms);
-    });
-    const unsubP = onSnapshot(collection(db, getCollectionPath('participants')), (snap) => {
-      const ps = snap.docs.map(d => ({id: d.id, ...d.data()}));
-      ps.sort((a, b) => a.nama.localeCompare(b.nama));
-      setParticipants(ps);
-    });
-    return () => { unsubM(); unsubP(); };
-  }, [db, authUser]);
+  const attendancesData = useSupabaseData('attendances');
 
   useEffect(() => {
-    if (!selectedMeetingId || !authUser) { setAttendances({}); return; }
-    const unsubA = onSnapshot(collection(db, getCollectionPath('attendances')), (snap) => {
-      const atts = {};
-      snap.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.meetingId === selectedMeetingId) atts[data.participantId] = { id: doc.id, status: data.status };
-      });
-      setAttendances(atts);
+    if (!selectedMeetingId) { setAttendances({}); return; }
+    const atts = {};
+    attendancesData.forEach(data => {
+      if (data.meetingId === selectedMeetingId) atts[data.participantId] = { id: data.id, status: data.status };
     });
-    return () => unsubA();
-  }, [db, selectedMeetingId, authUser]);
+    setAttendances(atts);
+  }, [attendancesData, selectedMeetingId]);
 
   const handleCreateMeeting = async (e) => {
     e.preventDefault();
     try {
-      const docRef = await addDoc(collection(db, getCollectionPath('meetings')), { tanggal: newDate, createdAt: new Date().toISOString() });
+      const { data, error } = await supabase.from('meetings').insert({ tanggal: newDate, createdAt: new Date().toISOString() }).select();
+      if (error) throw error;
       showToast('Pertemuan dibuat.');
       setIsModalOpen(false);
-      setSelectedMeetingId(docRef.id);
+      if (data && data[0]) setSelectedMeetingId(data[0].id);
       setNewDate('');
     } catch (err) { showToast('Gagal.', 'error'); }
   };
@@ -598,7 +642,7 @@ function AdminKehadiran({ db, authUser, showToast }) {
   const handleDeleteMeeting = async () => {
     if (!deleteId) return;
     try {
-      await deleteDoc(doc(db, getDocPath('meetings', deleteId)));
+      await supabase.from('meetings').delete().eq('id', deleteId);
       showToast('Dihapus.');
       if (selectedMeetingId === deleteId) setSelectedMeetingId(null);
       setDeleteId(null);
@@ -609,9 +653,9 @@ function AdminKehadiran({ db, authUser, showToast }) {
     const existing = attendances[participantId];
     try {
       if (existing) {
-        await updateDoc(doc(db, getDocPath('attendances', existing.id)), { status: newStatus });
+        await supabase.from('attendances').update({ status: newStatus }).eq('id', existing.id);
       } else {
-        await addDoc(collection(db, getCollectionPath('attendances')), { meetingId: selectedMeetingId, participantId, status: newStatus });
+        await supabase.from('attendances').insert({ meetingId: selectedMeetingId, participantId, status: newStatus });
       }
     } catch (err) { showToast('Gagal.', 'error'); }
   };
@@ -693,30 +737,25 @@ function AdminKehadiran({ db, authUser, showToast }) {
   );
 }
 
-function AdminKas({ db, authUser, showToast }) {
-  const [participants, setParticipants] = useState([]);
+function AdminKas({ showToast }) {
+  const participantsData = useSupabaseData('peserta');
+  const participants = [...participantsData].sort((a,b) => a.nama.localeCompare(b.nama));
+  const kasDataList = useSupabaseData('kas');
+  
   const [kasData, setKasData] = useState({});
   const [search, setSearch] = useState('');
 
   useEffect(() => {
-    if (!authUser) return;
-    const unsubP = onSnapshot(collection(db, getCollectionPath('participants')), (snap) => {
-      const ps = snap.docs.map(d => ({id: d.id, ...d.data()}));
-      ps.sort((a,b) => a.nama.localeCompare(b.nama));
-      setParticipants(ps);
-    });
-    const unsubK = onSnapshot(collection(db, getCollectionPath('kas')), (snap) => {
-      const k = {};
-      snap.docs.forEach(doc => k[doc.id] = doc.data().status);
-      setKasData(k);
-    });
-    return () => { unsubP(); unsubK(); };
-  }, [db, authUser]);
+    const k = {};
+    kasDataList.forEach(doc => k[doc.id] = doc.status);
+    setKasData(k);
+  }, [kasDataList]);
 
   const toggleKasStatus = async (participantId) => {
     const next = (kasData[participantId] === 'sudah_bayar') ? 'belum_bayar' : 'sudah_bayar';
-    try { await setDoc(doc(db, getDocPath('kas', participantId)), { status: next, updatedAt: new Date().toISOString() }); }
-    catch (err) { showToast('Gagal.', 'error'); }
+    try { 
+      await supabase.from('kas').upsert({ id: participantId, status: next, updatedAt: new Date().toISOString() }); 
+    } catch (err) { showToast('Gagal.', 'error'); }
   };
 
   const filtered = participants.filter(p => p.nama.toLowerCase().includes(search.toLowerCase()));
@@ -749,9 +788,13 @@ function AdminKas({ db, authUser, showToast }) {
   );
 }
 
-function AdminIuran({ db, authUser, showToast }) {
-  const [iurans, setIurans] = useState([]);
-  const [participants, setParticipants] = useState([]);
+function AdminIuran({ showToast }) {
+  const iuransData = useSupabaseData('iurans');
+  const iurans = [...iuransData];
+  const participantsData = useSupabaseData('peserta');
+  const participants = [...participantsData].sort((a,b)=>a.nama.localeCompare(b.nama));
+  const paymentsData = useSupabaseData('iuran_payments');
+
   const [selectedIuranId, setSelectedIuranId] = useState(null);
   const [payments, setPayments] = useState({});
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -759,38 +802,24 @@ function AdminIuran({ db, authUser, showToast }) {
   const [deleteId, setDeleteId] = useState(null);
 
   useEffect(() => {
-    if (!authUser) return;
-    const unsubI = onSnapshot(collection(db, getCollectionPath('iurans')), (snap) => setIurans(snap.docs.map(d => ({id: d.id, ...d.data()}))));
-    const unsubP = onSnapshot(collection(db, getCollectionPath('participants')), (snap) => {
-      const ps = snap.docs.map(d => ({id: d.id, ...d.data()}));
-      ps.sort((a,b)=>a.nama.localeCompare(b.nama));
-      setParticipants(ps);
+    if (!selectedIuranId) return;
+    const pym = {};
+    paymentsData.forEach(data => {
+      if (data.iuranId === selectedIuranId) pym[data.participantId] = { id: data.id, status: data.status };
     });
-    return () => { unsubI(); unsubP(); };
-  }, [db, authUser]);
-
-  useEffect(() => {
-    if (!selectedIuranId || !authUser) return;
-    const unsubPym = onSnapshot(collection(db, getCollectionPath('iuran_payments')), (snap) => {
-      const pym = {};
-      snap.docs.forEach(doc => {
-        const data = doc.data();
-        if (data.iuranId === selectedIuranId) pym[data.participantId] = { id: doc.id, status: data.status };
-      });
-      setPayments(pym);
-    });
-    return () => unsubPym();
-  }, [db, selectedIuranId, authUser]);
+    setPayments(pym);
+  }, [paymentsData, selectedIuranId]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
       if (formData.id) {
-        await updateDoc(doc(db, getDocPath('iurans', formData.id)), { nama: formData.nama, catatan: formData.catatan });
+        await supabase.from('iurans').update({ nama: formData.nama, catatan: formData.catatan }).eq('id', formData.id);
         showToast('Iuran diperbarui.');
       } else {
-        const res = await addDoc(collection(db, getCollectionPath('iurans')), { nama: formData.nama, catatan: formData.catatan, createdAt: new Date().toISOString() });
-        setSelectedIuranId(res.id);
+        const { data, error } = await supabase.from('iurans').insert({ nama: formData.nama, catatan: formData.catatan, createdAt: new Date().toISOString() }).select();
+        if (error) throw error;
+        if (data && data[0]) setSelectedIuranId(data[0].id);
         showToast('Iuran dibuat.');
       }
       setIsModalOpen(false);
@@ -801,7 +830,7 @@ function AdminIuran({ db, authUser, showToast }) {
   const handleDelete = async () => {
     if (!deleteId) return;
     try {
-      await deleteDoc(doc(db, getDocPath('iurans', deleteId)));
+      await supabase.from('iurans').delete().eq('id', deleteId);
       showToast('Dihapus.');
       if(selectedIuranId === deleteId) setSelectedIuranId(null);
       setDeleteId(null);
@@ -813,9 +842,9 @@ function AdminIuran({ db, authUser, showToast }) {
     const newStatus = existing?.status === 'sudah_bayar' ? 'belum_bayar' : 'sudah_bayar';
     try {
       if (existing) {
-        await updateDoc(doc(db, getDocPath('iuran_payments', existing.id)), { status: newStatus });
+        await supabase.from('iuran_payments').update({ status: newStatus }).eq('id', existing.id);
       } else {
-        await addDoc(collection(db, getCollectionPath('iuran_payments')), { iuranId: selectedIuranId, participantId, status: newStatus });
+        await supabase.from('iuran_payments').insert({ iuranId: selectedIuranId, participantId, status: newStatus });
       }
     } catch (err) { showToast('Gagal.', 'error'); }
   };
@@ -888,26 +917,17 @@ function AdminIuran({ db, authUser, showToast }) {
   );
 }
 
-function AdminJadwal({ db, authUser, showToast }) {
-  const [schedules, setSchedules] = useState([]);
+function AdminJadwal({ showToast }) {
+  const schedulesData = useSupabaseData('activities'); // Sesuai permintaan tabel 'activities'
+  const schedules = [...schedulesData].sort((a,b) => new Date(a.tanggal).getTime() - new Date(b.tanggal).getTime());
+
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [formData, setFormData] = useState({ id: null, nama_acara: '', tanggal: '', waktu_mulai: '', waktu_selesai: '', catatan: '' });
   const [deleteId, setDeleteId] = useState(null);
 
-  useEffect(() => {
-    if (!authUser) return;
-    const unsub = onSnapshot(collection(db, getCollectionPath('schedules')), (snap) => {
-      const s = snap.docs.map(d => ({id: d.id, ...d.data()}));
-      s.sort((a,b) => new Date(a.tanggal).getTime() - new Date(b.tanggal).getTime());
-      setSchedules(s);
-    });
-    return () => unsub();
-  }, [db, authUser]);
-
   const handleSubmit = async (e) => {
     e.preventDefault();
     try {
-      // Bersihkan data dari properti id null sebelum disimpan ke Firebase
       const payload = {
         nama_acara: formData.nama_acara,
         tanggal: formData.tanggal,
@@ -917,10 +937,10 @@ function AdminJadwal({ db, authUser, showToast }) {
       };
 
       if (formData.id) {
-        await updateDoc(doc(db, getDocPath('schedules', formData.id)), payload);
+        await supabase.from('activities').update(payload).eq('id', formData.id);
         showToast('Jadwal Acara diperbarui.');
       } else {
-        await addDoc(collection(db, getCollectionPath('schedules')), { ...payload, createdAt: new Date().toISOString() });
+        await supabase.from('activities').insert({ ...payload, createdAt: new Date().toISOString() });
         showToast('Jadwal Acara berhasil ditambahkan.');
       }
       setIsModalOpen(false);
@@ -934,7 +954,7 @@ function AdminJadwal({ db, authUser, showToast }) {
   const handleDelete = async () => {
     if (!deleteId) return;
     try {
-      await deleteDoc(doc(db, getDocPath('schedules', deleteId)));
+      await supabase.from('activities').delete().eq('id', deleteId);
       showToast('Jadwal Acara dihapus.');
       setDeleteId(null);
     } catch (err) { showToast('Gagal menghapus.', 'error'); }
@@ -981,7 +1001,7 @@ function AdminJadwal({ db, authUser, showToast }) {
   );
 }
 
-function ParentDashboard({ participant, onBack, db, authUser }) {
+function ParentDashboard({ participant, onBack }) {
   const [activeTab, setActiveTab] = useState('kehadiran');
   const [attendances, setAttendances] = useState([]);
   const [kasStatus, setKasStatus] = useState('belum_bayar');
@@ -989,41 +1009,40 @@ function ParentDashboard({ participant, onBack, db, authUser }) {
   const [schedules, setSchedules] = useState([]);
 
   useEffect(() => {
-    if (!authUser) return;
     const fetchParentData = async () => {
       try {
-        const snapM = await getDocs(collection(db, getCollectionPath('meetings')));
-        const snapA = await getDocs(collection(db, getCollectionPath('attendances')));
-        let ms = snapM.docs.map(d => ({id: d.id, ...d.data()}));
+        const { data: snapM } = await supabase.from('meetings').select('*');
+        const { data: snapA } = await supabase.from('attendances').select('*').eq('participantId', participant.id);
+        
+        let ms = snapM || [];
         ms.sort((a,b) => new Date(b.tanggal).getTime() - new Date(a.tanggal).getTime());
 
         const attMap = {};
-        snapA.docs.forEach(d => { if(d.data().participantId === participant.id) attMap[d.data().meetingId] = d.data().status; });
+        (snapA || []).forEach(d => { attMap[d.meetingId] = d.status; });
 
         const history = [];
         ms.forEach(m => { if(attMap[m.id]) history.push({ tanggal: m.tanggal, status: attMap[m.id] }); });
         setAttendances(history);
 
-        const kasDoc = await getDoc(doc(db, getDocPath('kas', participant.id)));
-        if (kasDoc.exists()) setKasStatus(kasDoc.data().status);
+        const { data: kasDoc } = await supabase.from('kas').select('*').eq('id', participant.id).single();
+        if (kasDoc) setKasStatus(kasDoc.status);
 
-        const snapI = await getDocs(collection(db, getCollectionPath('iurans')));
-        const snapPym = await getDocs(collection(db, getCollectionPath('iuran_payments')));
+        const { data: snapI } = await supabase.from('iurans').select('*');
+        const { data: snapPym } = await supabase.from('iuran_payments').select('*').eq('participantId', participant.id);
         const pymMap = {};
-        snapPym.docs.forEach(d => { if(d.data().participantId === participant.id) pymMap[d.data().iuranId] = d.data().status; });
+        (snapPym || []).forEach(d => { pymMap[d.iuranId] = d.status; });
 
-        setIurans(snapI.docs.map(d => ({ nama: d.data().nama, catatan: d.data().catatan, status: pymMap[d.id] || 'belum_bayar' })));
+        setIurans((snapI || []).map(d => ({ nama: d.nama, catatan: d.catatan, status: pymMap[d.id] || 'belum_bayar' })));
 
-        const snapS = await getDocs(collection(db, getCollectionPath('schedules')));
-        let scheds = snapS.docs.map(d => d.data());
+        const { data: snapS } = await supabase.from('activities').select('*');
+        let scheds = snapS || [];
         scheds.sort((a,b) => new Date(a.tanggal).getTime() - new Date(b.tanggal).getTime());
         
-        // Hapus filter waktu agar semua jadwal acara (termasuk yang sudah lalu) tetap muncul
         setSchedules(scheds);
       } catch(err) { console.error(err); }
     };
     fetchParentData();
-  }, [db, participant.id, authUser]);
+  }, [participant.id]);
 
   const TabButton = ({ id, label, icon: Icon }) => (
     <button onClick={() => setActiveTab(id)} className={`flex items-center justify-center flex-1 py-3 text-sm font-medium border-b-2 ${activeTab === id ? 'border-emerald-600 text-emerald-700 bg-emerald-50/50' : 'border-transparent text-gray-500 hover:bg-gray-50'}`}>
